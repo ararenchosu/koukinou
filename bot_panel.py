@@ -1,7 +1,11 @@
 """
-Discord 音楽BOT - パネル操作版
+Discord 音楽BOT - パネル操作版（Spotifyプレイリスト対応 / FadeHost・クッキー版）
 - 曲の追加も含め、すべてパネル（ボタン + モーダル）で操作可能
 - !panel または /panel でパネルを召喚したら、あとはコマンド不要
+- Spotify単曲 / プレイリスト / アルバムのリンクを貼ると、YouTubeで検索して代替再生
+  （プレイリストは最大50曲まで一括追加、非公開プレイリストは取得不可）
+- FadeHost用クッキー対応: 環境変数 YT_COOKIES_B64（推奨）/ YTDLP_COOKIEFILE=/data/cookies.txt
+  手順は FADEHOST_COOKIES.md を参照。cookies.txt は絶対にGitHubへ上げないこと。
 
 操作の流れ:
     1. VCに入る
@@ -16,7 +20,12 @@ Discord 音楽BOT - パネル操作版
 
 import os
 import asyncio
+import base64
+import json
+import re
 import random
+import urllib.request
+import urllib.parse
 from collections import deque
 
 import discord
@@ -29,6 +38,115 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 PREFIX = os.getenv("COMMAND_PREFIX", "!")
 
+
+# ---------------- YouTube bot判定対策: cookies（FadeHost クッキー版） ----------------
+# FadeHostのようなデータセンターIPはYouTubeにbot判定されやすい。
+# ログイン済みブラウザから書き出した cookies.txt (Netscape形式) を使う。
+# 優先順位:
+#   1. 環境変数 YTDLP_COOKIEFILE = cookies.txt のパス（例: /data/cookies.txt）
+#   2. 環境変数 YT_COOKIES_B64 = cookies.txt をBase64化した1行文字列【FadeHostではこれが推奨】
+#   3. /data/cookies.txt（FadeHostの永続フォルダ）
+#   4. bot_panel.py と同じフォルダ / 実行フォルダの cookies.txt（ローカル実行用）
+# ※ cookies はログイン情報そのもの。GitHubに上げない・他人に送らないこと。.gitignore済み前提。
+# ※ メインのGoogleアカウントではなく、BOT専用のサブアカウント推奨（凍結・セッション無効化リスクあり）
+# ※ 書き出し直後はYouTubeタブを閉じない等、セッションを変えると無効化されやすいので注意。
+def _validate_cookie_bytes(raw: bytes) -> str | None:
+    """cookies.txtの中身チェック。問題があれば理由を返す（値は表示しない）"""
+    if not raw:
+        return "中身が空です"
+    text = raw.decode("utf-8", errors="ignore")
+    if text.lstrip().startswith("{") or text.lstrip().startswith("["):
+        return "JSON形式になっています。Netscape形式の cookies.txt で書き出してください（拡張機能のExport形式を確認）"
+    lines = [ln for ln in text.splitlines() if ln and not ln.startswith("#")]
+    youtube_lines = [ln for ln in lines if "youtube.com" in ln or "google.com" in ln]
+    if not youtube_lines:
+        return "youtube.com / google.com のクッキーが含まれていません。YouTubeにログインした状態で youtube.com を開いて書き出してください"
+    # Netscape形式はタブ区切り7列
+    if not any(len(ln.split("\t")) >= 7 for ln in youtube_lines):
+        return "タブ区切りのNetscape形式ではないようです"
+    return None
+
+
+def _describe_cookie_file(path: str) -> str:
+    """ログ用: クッキーの値を見せずに、件数だけを返す"""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+        text = raw.decode("utf-8", errors="ignore")
+        lines = [ln for ln in text.splitlines() if ln and not ln.startswith("#")]
+        yt = sum(1 for ln in lines if "youtube.com" in ln)
+        gg = sum(1 for ln in lines if "google.com" in ln)
+        problem = _validate_cookie_bytes(raw)
+        if problem:
+            return f"{len(raw)} bytes / YouTube {yt}件 / Google {gg}件 / ⚠️ {problem}"
+        return f"{len(raw)} bytes / YouTube {yt}件 / Google {gg}件 / 形式OK"
+    except Exception as e:
+        return f"読み取り失敗: {e}"
+
+
+def _resolve_cookie_file():
+    path_env = os.getenv("YTDLP_COOKIEFILE")
+    if path_env:
+        if os.path.exists(path_env):
+            return path_env
+        print(f"⚠️ YTDLP_COOKIEFILE={path_env} が見つかりません")
+
+    b64 = os.getenv("YT_COOKIES_B64")
+    if b64:
+        # 改行・空白が混じっても動くように除去してからデコードする
+        cleaned = "".join(b64.split())
+        raw = None
+        try:
+            raw = base64.b64decode(cleaned, validate=False)
+        except Exception as e:
+            print(f"⚠️ YT_COOKIES_B64 のデコードに失敗: {e}")
+        if raw:
+            problem = _validate_cookie_bytes(raw)
+            if problem:
+                print(f"⚠️ YT_COOKIES_B64 の中身に問題があります: {problem}")
+            # FadeHost等はコードフォルダが読み取り専用なので /tmp -> /data の順で書ける場所を探す
+            for dest in ("/tmp/youtube_cookies.txt", "/data/youtube_cookies.txt"):
+                try:
+                    with open(dest, "wb") as f:
+                        f.write(raw)
+                    return dest
+                except Exception:
+                    continue
+            print("⚠️ YT_COOKIES_B64 を書き込める場所がありませんでした")
+
+    for candidate in (
+        "/data/cookies.txt",  # FadeHostの永続フォルダ（ファイルマネージャでアップ可・有料プラン）
+        "/data/youtube_cookies.txt",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt"),
+        os.path.join(os.getcwd(), "cookies.txt"),
+    ):
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+COOKIE_FILE = _resolve_cookie_file()
+if COOKIE_FILE:
+    print(f"YouTube cookies: 使用する ({COOKIE_FILE}) / {_describe_cookie_file(COOKIE_FILE)}")
+else:
+    print("⚠️ YouTube cookies: なし。FadeHostではYouTubeにbot判定される可能性が高いです。")
+    print("   FadeHostのパネルで環境変数 YT_COOKIES_B64 を設定してください（手順: FADEHOST_COOKIES.md）")
+try:
+    print(f"yt-dlp version: {yt_dlp.version.__version__}")
+except Exception:
+    pass
+
+
+class YouTubeBotCheckError(Exception):
+    """YouTubeの 'Sign in to confirm you're not a bot' でブロックされた"""
+    pass
+
+
+def _is_bot_check_error(e) -> bool:
+    s = str(e)
+    return "not a bot" in s or "Sign in to confirm" in s
+
+
 YTDL_OPTIONS = {
     "format": "bestaudio/best",
     "noplaylist": True,
@@ -37,6 +155,8 @@ YTDL_OPTIONS = {
     "default_search": "ytsearch1",
     "source_address": "0.0.0.0",
 }
+if COOKIE_FILE:
+    YTDL_OPTIONS["cookiefile"] = COOKIE_FILE
 YTDL_SEARCH_OPTIONS = {**YTDL_OPTIONS, "default_search": "ytsearch5", "noplaylist": True}
 
 FFMPEG_OPTIONS = {
@@ -156,17 +276,218 @@ def format_duration(seconds):
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
+# ---------------- DRMサイト対応 ----------------
+# Spotify / Apple Music / Amazon Music / Tidal などはDRM保護のため
+# yt-dlpで直接再生できない。URLから曲名+アーティスト名を取り出し、
+# YouTubeで検索して代替再生する。
+DRM_DOMAINS = (
+    "open.spotify.com",
+    "music.apple.com",
+    "music.amazon.",
+    "amazon.co.jp/music",
+    "tidal.com",
+    "music.youtube.com",  # これは再生可なので含めないケースが多いが有料限定曲用に注意
+)
+# music.youtube.com は通常再生できるので対象から外す
+DRM_DOMAINS = tuple(d for d in DRM_DOMAINS if d != "music.youtube.com")
+
+
+def is_drm_url(url: str) -> bool:
+    return any(d in url for d in DRM_DOMAINS) or "spotify.com" in url or "apple.com/music" in url
+
+
+def _fetch_spotify_oembed(url: str):
+    """SpotifyのoEmbed（APIキー不要）から曲名を取得 ※アーティスト名は含まれない"""
+    api = "https://open.spotify.com/oembed?url=" + urllib.parse.quote(url, safe="")
+    req = urllib.request.Request(api, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=10) as res:
+        data = json.loads(res.read().decode("utf-8"))
+    title = (data.get("title") or "").strip()
+    author = (data.get("author_name") or "").strip()
+    if title and author:
+        return f"{author} {title}"
+    return title or None
+
+
+def _fetch_spotify_embed(url: str):
+    """Spotify埋め込みページのJSONから 曲名+アーティスト名 を取得（APIキー不要・精度が高い）
+    対応: /track/, /album/, /episode/ の単体リンク。intl-ja等の言語prefix付きURLも可。
+    """
+    m = re.search(r"spotify\.com/(?:intl-[a-z\-]+/)?(track|album|episode)/([A-Za-z0-9]+)", url)
+    if not m:
+        return None
+    kind, spotify_id = m.group(1), m.group(2)
+    embed_url = f"https://open.spotify.com/embed/{kind}/{spotify_id}"
+    req = urllib.request.Request(embed_url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=10) as res:
+        html = res.read().decode("utf-8", errors="ignore")
+    # __NEXT_DATA__ 内の entity から name と artists を取る
+    name_match = re.search(r'"entity":\{"type":"(?:track|album|episode)"[^}]*?"name":"([^"]+)"', html)
+    if not name_match:
+        name_match = re.search(r'"name":"([^"]+)","uri":"spotify:(?:track|album|episode):', html)
+    if not name_match:
+        return None
+    title = name_match.group(1)
+    artists = re.findall(r'"artists":\[\{"name":"([^"]+)"', html)
+    if not artists:
+        artists = re.findall(r'"artistName":"([^"]+)"', html)
+    if artists:
+        return f"{artists[0]} {title}"
+    return title
+
+
+MAX_PLAYLIST_TRACKS = 50  # Spotifyプレイリスト/アルバムを一度に追加する上限
+
+
+def is_spotify_collection_url(url: str) -> bool:
+    """Spotifyのプレイリスト / アルバムURLかどうか"""
+    return bool(re.search(r"spotify\.com/(?:intl-[a-z\-]+/)?(playlist|album)/[A-Za-z0-9]+", url or ""))
+
+
+def _fetch_spotify_collection(url: str):
+    """Spotifyプレイリスト/アルバムの埋め込みページから全曲リストを取得（APIキー不要）
+    戻り値: (コレクション名, [検索クエリ, ...])  例: ("Today's Top Hits", ["Tate McRae Housewife", ...])
+    埋め込みページの __NEXT_DATA__ -> entity.trackList に title=曲名, subtitle=アーティスト名 が入っている。
+    """
+    m = re.search(r"spotify\.com/(?:intl-[a-z\-]+/)?(playlist|album)/([A-Za-z0-9]+)", url)
+    if not m:
+        return None, []
+    kind, spotify_id = m.group(1), m.group(2)
+    embed_url = f"https://open.spotify.com/embed/{kind}/{spotify_id}"
+    req = urllib.request.Request(embed_url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=15) as res:
+        html = res.read().decode("utf-8", errors="ignore")
+
+    name = None
+    queries = []
+    m_data = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.S)
+    if m_data:
+        try:
+            data = json.loads(m_data.group(1))
+            entity = data["props"]["pageProps"]["state"]["data"]["entity"]
+            name = entity.get("name") or entity.get("title")
+            for t in entity.get("trackList", [])[:MAX_PLAYLIST_TRACKS]:
+                title = (t.get("title") or "").replace("\xa0", " ").strip()
+                artist = (t.get("subtitle") or "").replace("\xa0", " ").strip()
+                if title:
+                    queries.append(f"{artist} {title}".strip())
+        except Exception as e:
+            print(f"SpotifyコレクションJSON解析失敗: {e}")
+
+    if not queries:
+        # フォールバック: 正規表現で title/subtitle のペアを拾う（アルバム等で構造が違う場合）
+        pairs = re.findall(r'"title":"([^"]+)","subtitle":"([^"]+)"', html)
+        for title, artist in pairs[:MAX_PLAYLIST_TRACKS]:
+            queries.append(f"{artist} {title}".strip())
+        if not name:
+            nm = re.search(r'"entity":\{"type":"(?:playlist|album)","name":"([^"]+)"', html)
+            if nm:
+                name = nm.group(1)
+    return name, queries
+
+
+async def fetch_spotify_collection(url: str):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, lambda: _fetch_spotify_collection(url))
+
+
+async def load_spotify_collection(player, url: str, user, notify=None):
+    """プレイリスト/アルバムをYouTube検索しながら1曲ずつキューへ追加する（バックグラウンド用）
+    notify: async callable(str) 進捗通知用（省略可）
+    戻り値: (コレクション名, 追加できた曲数, 全曲数)
+    """
+    name, queries = await fetch_spotify_collection(url)
+    if not queries:
+        if notify:
+            await notify("❌ プレイリストの曲一覧が取得できませんでした。公開プレイリストか確認してください（非公開は取得できません）。")
+        return name, 0, 0
+
+    if notify:
+        await notify(
+            f"📋 Spotifyプレイリスト **{name or '（無題）'}** から {len(queries)}曲を読み込みます。\n"
+            f"1曲ずつYouTubeで検索して追加するので、全曲入るまで少し時間がかかります（目安: 1曲あたり1〜3秒）。最初の曲はすぐ再生が始まります。"
+        )
+
+    added = 0
+    for q in queries:
+        try:
+            results = await extract_info(q, search=False)
+            if not results:
+                continue
+            # add_and_play は再生中でなければ自動で再生開始する
+            await player.add_and_play(results[0], user)
+            added += 1
+        except Exception as e:
+            print(f"プレイリスト曲の追加失敗 ({q}): {e}")
+            continue
+
+    if notify:
+        await notify(f"✅ プレイリスト **{name or ''}** の読み込み完了: {added}/{len(queries)}曲をキューに追加しました。")
+    await player.refresh_panel()
+    return name, added, len(queries)
+
+
+def _query_from_url_slug(url: str):
+    """Apple Music等のURL末尾スラッグから検索語を推測するフォールバック"""
+    path = urllib.parse.urlparse(url).path
+    parts = [p for p in path.split("/") if p and not p.isdigit() and p not in ("jp", "us", "song", "album", "playlist", "track")]
+    if not parts:
+        return None
+    slug = parts[-1]
+    slug = re.sub(r"[-_]+", " ", slug)
+    slug = re.sub(r"\d+$", "", slug).strip()
+    return slug or None
+
+
+async def resolve_drm_query(url: str):
+    """DRMサイトのURL -> YouTube検索用クエリ。取れなければNone"""
+    loop = asyncio.get_event_loop()
+
+    def _resolve():
+        if "spotify.com" in url:
+            # 1) 埋め込みページ: 曲名+アーティスト名まで取れる（最優先）
+            try:
+                q = _fetch_spotify_embed(url)
+                if q:
+                    return q
+            except Exception as e:
+                print(f"Spotify embed取得失敗: {e}")
+            # 2) oEmbed: 曲名のみのフォールバック
+            try:
+                q = _fetch_spotify_oembed(url)
+                if q:
+                    return q
+            except Exception as e:
+                print(f"Spotify oEmbed失敗: {e}")
+        return _query_from_url_slug(url)
+
+    return await loop.run_in_executor(None, _resolve)
+
+
+async def extract_from_drm_url(url: str):
+    """DRM URLをYouTube検索に変換して曲情報を返す。(info, 検索クエリ)"""
+    search_query = await resolve_drm_query(url)
+    if not search_query:
+        return None, None
+    results = await extract_info(search_query, search=False)
+    if not results:
+        return None, search_query
+    return results[0], search_query
+
+
 # ---------------- yt-dlp ----------------
 async def extract_info(query: str, search: bool = False):
     loop = asyncio.get_event_loop()
-    opts = YTDL_SEARCH_OPTIONS if search else YTDL_OPTIONS
-    ydl = yt_dlp.YoutubeDL(opts)
+    base_opts = YTDL_SEARCH_OPTIONS if search else YTDL_OPTIONS
 
-    def _extract():
+    def _extract_with(opts):
+        ydl = yt_dlp.YoutubeDL(opts)
         data = ydl.extract_info(query, download=False)
         entries = data["entries"] if "entries" in data else [data]
         results = []
         for d in entries:
+            if d is None:
+                continue
             results.append({
                 "url": d["url"],
                 "title": d.get("title", "Unknown"),
@@ -175,6 +496,36 @@ async def extract_info(query: str, search: bool = False):
                 "thumbnail": d.get("thumbnail"),
             })
         return results
+
+    def _extract():
+        try:
+            return _extract_with(base_opts)
+        except Exception as e:
+            if not _is_bot_check_error(e):
+                raise
+            # bot判定されたら、別クライアントで順にリトライ
+            # クッキー使用時はクッキーが活きる web系を優先し、無い時は android系を優先する
+            last_error = e
+            clients = ("web", "web_embedded", "tv", "mweb") if COOKIE_FILE else ("android", "ios", "web_embedded", "android_vr")
+            for client in clients:
+                alt_opts = dict(base_opts)
+                alt_opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+                try:
+                    print(f"YouTube bot判定のため player_client={client} でリトライ中...")
+                    return _extract_with(alt_opts)
+                except Exception as e2:
+                    last_error = e2
+                    if not _is_bot_check_error(e2):
+                        raise
+            raise YouTubeBotCheckError(
+                "YouTubeにbot判定されて再生できませんでした。"
+                + (
+                    "cookiesは読み込まれていますが判定を回避できませんでした。cookiesの再書き出し（サブ垢でYouTubeを開いた状態で再Export）か、FadeHostのリージョン変更を試してください。"
+                    if COOKIE_FILE else
+                    "FadeHostでは cookies が必要です。環境変数 YT_COOKIES_B64 を設定してください（手順: FADEHOST_COOKIES.md）。"
+                )
+                + f" 元のエラー: {last_error}"
+            )
 
     return await loop.run_in_executor(None, _extract)
 
@@ -205,7 +556,34 @@ class AddSongModal(discord.ui.Modal, title="🎵 曲を追加"):
         is_url = query.startswith("http://") or query.startswith("https://")
 
         try:
-            if is_url:
+            if is_url and is_spotify_collection_url(query):
+                # Spotify プレイリスト / アルバム: バックグラウンドで全曲追加（最初の曲はすぐ再生される）
+                await interaction.followup.send("📋 Spotifyプレイリストとして読み込みを開始します…", ephemeral=True)
+
+                async def _notify(msg):
+                    try:
+                        await interaction.followup.send(msg, ephemeral=True)
+                    except Exception:
+                        pass
+
+                asyncio.create_task(load_spotify_collection(self.player, query, interaction.user, notify=_notify))
+            elif is_url and is_drm_url(query):
+                # DRMサイトは直接再生不可 -> YouTubeで同じ曲を検索して代替再生
+                info, search_query = await extract_from_drm_url(query)
+                if not info:
+                    await interaction.followup.send(
+                        "❌ そのリンクはDRM保護されたサービス（Spotify / Apple Music等）のため直接再生できません。\n"
+                        "曲名がURLから取得できなかったので、パネルから **曲名＋アーティスト名で検索** して追加してください。",
+                        ephemeral=True,
+                    )
+                    return
+                await self.player.add_and_play(info, interaction.user)
+                await interaction.followup.send(
+                    f"⚠️ そのサービスはDRMで直接再生できないため、YouTubeで検索して代替再生します。\n"
+                    f"検索: `{search_query}`\n✅ 追加しました: **{info['title']}**",
+                    ephemeral=True,
+                )
+            elif is_url:
                 results = await extract_info(query, search=False)
                 info = results[0]
                 await self.player.add_and_play(info, interaction.user)
@@ -223,7 +601,19 @@ class AddSongModal(discord.ui.Modal, title="🎵 曲を追加"):
                 )
                 await interaction.followup.send(f"🔍 検索結果（プルダウンで選択）\n{desc}", view=view, ephemeral=True)
         except Exception as e:
-            await interaction.followup.send(f"❌ 取得に失敗しました: {e}", ephemeral=True)
+            if isinstance(e, YouTubeBotCheckError) or _is_bot_check_error(e):
+                await interaction.followup.send(
+                    "❌ YouTubeにbot判定されて再生できませんでした。\n"
+                    "サーバー側に **cookies.txt** を設置すると解決することが多いです。管理者に確認してください。",
+                    ephemeral=True,
+                )
+            elif "DRM" in str(e):
+                await interaction.followup.send(
+                    "❌ そのリンクはDRM保護のため直接再生できません。YouTubeのURLか、曲名での検索で追加してください。",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.followup.send(f"❌ 取得に失敗しました: {e}", ephemeral=True)
 
 
 class SearchResultView(discord.ui.View):
@@ -434,8 +824,29 @@ async def play_cmd(ctx, *, query: str = None):
         return
     player = bot.get_player(ctx.guild)
     await player.connect(ctx.author.voice.channel)
-    results = await extract_info(query, search=False)
-    await player.add_and_play(results[0], ctx.author)
+    if query.startswith("http") and is_spotify_collection_url(query):
+        await ctx.send("📋 Spotifyプレイリストとして読み込みを開始します…")
+
+        async def _notify(msg):
+            await ctx.send(msg)
+
+        asyncio.create_task(load_spotify_collection(player, query, ctx.author, notify=_notify))
+    elif query.startswith("http") and is_drm_url(query):
+        info, search_query = await extract_from_drm_url(query)
+        if not info:
+            await ctx.send("❌ DRM保護されたサービスのリンクは直接再生できません。曲名で検索してください。")
+            return
+        await ctx.send(f"⚠️ DRMサイトのためYouTubeで代替再生します（検索: `{search_query}`）")
+        await player.add_and_play(info, ctx.author)
+    else:
+        try:
+            results = await extract_info(query, search=False)
+        except Exception as e:
+            if "DRM" in str(e):
+                await ctx.send("❌ DRM保護のため直接再生できません。YouTubeのURLか曲名検索で追加してください。")
+                return
+            raise
+        await player.add_and_play(results[0], ctx.author)
     if not player.panel_message:
         await send_panel(ctx.channel, player)
 
