@@ -690,6 +690,60 @@ async def extract_info(query: str, search: bool = False):
     return await loop.run_in_executor(None, _extract)
 
 
+async def diagnose_youtube(url: str) -> str:
+    """診断用: クライアント別に raw formats を取得し、結果をテキストで返す（!ytcheck から使う）
+    クッキーの値などの秘密情報は含めない。
+    """
+    loop = asyncio.get_event_loop()
+
+    def _run():
+        lines = []
+        try:
+            ver = yt_dlp.version.__version__
+        except Exception:
+            ver = "不明"
+        lines.append(f"yt-dlp version: {ver}")
+        if COOKIE_FILE:
+            lines.append(f"cookies: 使用する / {_describe_cookie_file(COOKIE_FILE)}")
+        else:
+            lines.append("cookies: なし")
+        lines.append(f"対象: {url}")
+        lines.append("")
+
+        client_patterns = [
+            ("default", None),
+            ("tv_embedded", ["tv_embedded"]),
+            ("android_vr", ["android_vr"]),
+            ("visionos+tv_embedded", ["visionos", "tv_embedded"]),
+            ("web", ["web"]),
+        ]
+        for label, clients in client_patterns:
+            opts = dict(YTDL_OPTIONS)
+            opts.pop("format", None)
+            if clients:
+                opts["extractor_args"] = {"youtube": {"player_client": list(clients)}}
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    data = ydl.extract_info(url, download=False, process=False)
+                formats = (data or {}).get("formats") or []
+                chosen = _pick_best_format(formats)
+                lines.append(f"■ {label}: formats {len(formats)}件 / 選択可能: {chosen['format_id'] if chosen else 'なし'}")
+                # 音声形式が先頭に来るように並べ替えて表示（診断で一番見たい部分）
+                ordered = sorted(formats, key=lambda f: (
+                    0 if (f.get("vcodec") in (None, "none") and f.get("acodec") not in (None, "none"))
+                    else 1 if (f.get("vcodec") not in (None, "none") and f.get("acodec") not in (None, "none"))
+                    else 2))
+                lines.append(f"  {_summarize_formats(ordered, limit=18)}")
+            except Exception as e:
+                kind = "bot判定" if _is_bot_check_error(e) else type(e).__name__
+                lines.append(f"■ {label}: 失敗 ({kind}: {str(e)[:140]})")
+        lines.append("")
+        lines.append("この画面のまま貼ってください（クッキーの値は含まれていません）。")
+        return "\n".join(lines)
+
+    return await loop.run_in_executor(None, _run)
+
+
 # ---------------- モーダル: 曲追加フォーム ----------------
 class AddSongModal(discord.ui.Modal, title="🎵 曲を追加"):
     query = discord.ui.TextInput(
@@ -1009,6 +1063,33 @@ async def play_cmd(ctx, *, query: str = None):
         await player.add_and_play(results[0], ctx.author)
     if not player.panel_message:
         await send_panel(ctx.channel, player)
+
+
+@bot.command(name="ytcheck")
+async def ytcheck_cmd(ctx, url: str = None):
+    """診断用: YouTubeのフォーマット取得状況をDiscord上に返す（VC不要・クッキーの値は含まない）
+    使い方: !ytcheck  または  !ytcheck <YouTubeのURL>
+    引数なしだと、失敗が報告されている動画で診断する。
+    """
+    target = url or "https://www.youtube.com/watch?v=3r8AHA5oEWQ"
+    await ctx.send(f"🔍 診断中です…（30〜60秒ほどかかります）\n対象: {target}")
+    try:
+        report = await diagnose_youtube(target)
+    except Exception as e:
+        await ctx.send(f"診断自体に失敗しました: {type(e).__name__}: {str(e)[:300]}")
+        return
+    # Discordの2000文字制限に合わせて分割して送る
+    text = f"```\n{report}\n```"
+    chunk = []
+    size = 0
+    for line in text.splitlines():
+        if size + len(line) + 1 > 1900 and chunk:
+            await ctx.send("\n".join(chunk))
+            chunk, size = [], 0
+        chunk.append(line)
+        size += len(line) + 1
+    if chunk:
+        await ctx.send("\n".join(chunk))
 
 
 if __name__ == "__main__":
