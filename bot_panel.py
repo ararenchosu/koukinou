@@ -710,16 +710,21 @@ async def diagnose_youtube(url: str) -> str:
         lines.append(f"対象: {url}")
         lines.append("")
 
+        # クッキー有無 × クライアント のマトリクスで切り分ける
+        # - クッキー無しで取れる -> クッキー/アカウント側が原因
+        # - どれでも取れない -> FadeHostのIP側が原因の可能性が高い
         client_patterns = [
-            ("default", None),
-            ("tv_embedded", ["tv_embedded"]),
-            ("android_vr", ["android_vr"]),
-            ("visionos+tv_embedded", ["visionos", "tv_embedded"]),
-            ("web", ["web"]),
+            ("cookies/default", True, None),
+            ("cookies/android_vr", True, ["android_vr"]),
+            ("NO-cookies/default", False, None),
+            ("NO-cookies/android_vr", False, ["android_vr"]),
+            ("NO-cookies/tv_embedded", False, ["tv_embedded"]),
         ]
-        for label, clients in client_patterns:
+        for label, use_cookie, clients in client_patterns:
             opts = dict(YTDL_OPTIONS)
             opts.pop("format", None)
+            if not use_cookie:
+                opts.pop("cookiefile", None)
             if clients:
                 opts["extractor_args"] = {"youtube": {"player_client": list(clients)}}
             try:
@@ -727,7 +732,8 @@ async def diagnose_youtube(url: str) -> str:
                     data = ydl.extract_info(url, download=False, process=False)
                 formats = (data or {}).get("formats") or []
                 chosen = _pick_best_format(formats)
-                lines.append(f"■ {label}: formats {len(formats)}件 / 選択可能: {chosen['format_id'] if chosen else 'なし'}")
+                avail = (data or {}).get("availability")
+                lines.append(f"■ {label}: formats {len(formats)}件 / 選択可能: {chosen['format_id'] if chosen else 'なし'} / availability: {avail}")
                 # 音声形式が先頭に来るように並べ替えて表示（診断で一番見たい部分）
                 ordered = sorted(formats, key=lambda f: (
                     0 if (f.get("vcodec") in (None, "none") and f.get("acodec") not in (None, "none"))
@@ -1069,27 +1075,36 @@ async def play_cmd(ctx, *, query: str = None):
 async def ytcheck_cmd(ctx, url: str = None):
     """診断用: YouTubeのフォーマット取得状況をDiscord上に返す（VC不要・クッキーの値は含まない）
     使い方: !ytcheck  または  !ytcheck <YouTubeのURL>
-    引数なしだと、失敗が報告されている動画で診断する。
+    引数なしだと、失敗中の動画＋比較用の世界的ヒット曲の2本を診断して
+    「その動画だけの問題か / IP・クッキー全体の問題か」を切り分ける。
     """
-    target = url or "https://www.youtube.com/watch?v=3r8AHA5oEWQ"
-    await ctx.send(f"🔍 診断中です…（30〜60秒ほどかかります）\n対象: {target}")
-    try:
-        report = await diagnose_youtube(target)
-    except Exception as e:
-        await ctx.send(f"診断自体に失敗しました: {type(e).__name__}: {str(e)[:300]}")
-        return
-    # Discordの2000文字制限に合わせて分割して送る
-    text = f"```\n{report}\n```"
-    chunk = []
-    size = 0
-    for line in text.splitlines():
-        if size + len(line) + 1 > 1900 and chunk:
+    if url:
+        targets = [url]
+    else:
+        targets = [
+            "https://www.youtube.com/watch?v=3r8AHA5oEWQ",  # 失敗中の動画
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",  # 比較用: Rick Astley (世界中で再生可のはず)
+        ]
+    await ctx.send("🔍 診断中です…（1〜2分ほどかかります）")
+
+    async def _send_report(report):
+        text = f"```\n{report}\n```"
+        chunk, size = [], 0
+        for line in text.splitlines():
+            if size + len(line) + 1 > 1900 and chunk:
+                await ctx.send("\n".join(chunk))
+                chunk, size = [], 0
+            chunk.append(line)
+            size += len(line) + 1
+        if chunk:
             await ctx.send("\n".join(chunk))
-            chunk, size = [], 0
-        chunk.append(line)
-        size += len(line) + 1
-    if chunk:
-        await ctx.send("\n".join(chunk))
+
+    for target in targets:
+        try:
+            report = await diagnose_youtube(target)
+            await _send_report(report)
+        except Exception as e:
+            await ctx.send(f"診断自体に失敗しました ({target}): {type(e).__name__}: {str(e)[:300]}")
 
 
 if __name__ == "__main__":
