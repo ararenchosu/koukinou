@@ -157,6 +157,22 @@ YTDL_OPTIONS = {
 }
 if COOKIE_FILE:
     YTDL_OPTIONS["cookiefile"] = COOKIE_FILE
+
+# プロキシ対応（任意）: FadeHostのIPがYouTubeに判定される場合に、
+# クリーンなIP（自宅回線・別リージョンのVPS等）経由でYouTubeへ接続するための逃げ道。
+# 環境変数 YTDLP_PROXY = http://host:port / socks5://host:port など。
+# 認証情報付きURLも使えるが、ログにはスキームとホストしか出さない。
+YT_PROXY = os.getenv("YTDLP_PROXY")
+if YT_PROXY:
+    YTDL_OPTIONS["proxy"] = YT_PROXY
+    try:
+        _pu = urllib.parse.urlparse(YT_PROXY)
+        print(f"YouTube proxy: 使用する ({_pu.scheme}://{_pu.hostname}:{_pu.port or ''})")
+    except Exception:
+        print("YouTube proxy: 使用する")
+else:
+    print("YouTube proxy: なし")
+
 YTDL_SEARCH_OPTIONS = {**YTDL_OPTIONS, "default_search": "ytsearch5", "noplaylist": True}
 
 FFMPEG_OPTIONS = {
@@ -475,6 +491,85 @@ async def extract_from_drm_url(url: str):
     return results[0], search_query
 
 
+# ---------------- Invidiousフォールバック ----------------
+# YouTube直接取得がIP判定で全滅した場合の逃げ道。
+# 公開Invidiousインスタンスは「インスタンスのサーバー側」でYouTubeを取得するため、
+# BOTのIPが判定されていても再生できることがある。
+# local=true を付けると音声URLがインスタンス経由（プロキシ）になり、
+# googlevideoのIP縛りも回避できる（実測済み）。
+# ※ ボランティア運営の公開インスタンス頼みなので、落ちる/遅い/制限される場合がある。
+# ※ 環境変数 INVIDIOUS_INSTANCES にカンマ区切りで追加/変更可能。INVIDIOUS_FALLBACK=0 で無効化。
+DEFAULT_INVIDIOUS_INSTANCES = [
+    "https://yt.chocolatemoo53.com",  # 2026-10-28 実測: 検索・音声取得・プロキシ再生OK
+]
+
+
+def _invidious_instances():
+    env = os.getenv("INVIDIOUS_INSTANCES", "").strip()
+    extra = [s.strip().rstrip("/") for s in env.split(",") if s.strip()]
+    merged = []
+    for inst in extra + DEFAULT_INVIDIOUS_INSTANCES:
+        if inst not in merged:
+            merged.append(inst)
+    return merged
+
+
+def _inv_json(instance: str, path: str, timeout: int = 15):
+    req = urllib.request.Request(instance + path, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as res:
+        return json.loads(res.read().decode("utf-8", errors="ignore"))
+
+
+def _inv_video_info(instance: str, video_id: str):
+    data = _inv_json(instance, f"/api/v1/videos/{video_id}?local=true&fields=title,lengthSeconds,adaptiveFormats")
+    audios = [f for f in (data.get("adaptiveFormats") or []) if str(f.get("type", "")).startswith("audio") and f.get("url")]
+    if not audios:
+        return None
+    audios.sort(key=lambda f: -(int(f.get("bitrate") or 0)))
+    best = audios[0]
+    return {
+        "url": best["url"],
+        "title": data.get("title", "Unknown"),
+        "webpage_url": f"https://www.youtube.com/watch?v={video_id}",
+        "duration": data.get("lengthSeconds"),
+        "thumbnail": f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+        "format_id": f"invidious-{best.get('itag')}",
+    }
+
+
+def _invidious_extract_sync(query: str, search: bool = False):
+    """Invidious経由で曲情報を取る（同期版・executor内で使う）"""
+    errors = []
+    m = re.search(r"(?:v=|youtu\.be/|/shorts/|/embed/)([A-Za-z0-9_-]{11})", query or "")
+    for instance in _invidious_instances():
+        try:
+            if m:
+                info = _inv_video_info(instance, m.group(1))
+                if info:
+                    print(f"Invidious成功: {instance} -> {info['title']} ({info['format_id']})")
+                    return [info]
+                errors.append(f"{instance}: 音声形式なし")
+                continue
+            results = _inv_json(instance, f"/api/v1/search?q={urllib.parse.quote(query)}&type=video&fields=videoId,title,lengthSeconds")
+            if not results:
+                errors.append(f"{instance}: 検索結果なし")
+                continue
+            infos = []
+            video_results = [r for r in results if r.get("videoId")]
+            for r in (video_results[:5] if search else video_results[:1]):
+                info = _inv_video_info(instance, r["videoId"])
+                if info:
+                    infos.append(info)
+            if infos:
+                print(f"Invidious成功: {instance} -> {infos[0]['title']} ({infos[0]['format_id']})")
+                return infos
+            errors.append(f"{instance}: 音声形式なし")
+        except Exception as e:
+            errors.append(f"{instance}: {type(e).__name__} {str(e)[:80]}")
+            continue
+    raise Exception("Invidiousでも取得できませんでした: " + " / ".join(errors[:3]))
+
+
 # ---------------- yt-dlp ----------------
 def _is_format_error(e) -> bool:
     return "Requested format is not available" in str(e)
@@ -674,6 +769,14 @@ async def extract_info(query: str, search: bool = False):
                     saw_bot_check = True
                 print(f"抽出リトライ: {label} 失敗 ({type(e).__name__}: {str(e)[:200]}) -> 次を試します")
                 continue
+        # 最後の逃げ道: Invidious経由（インスタンス側のIPで取得するため、BOTのIP判定を回避できる場合がある）
+        if os.getenv("INVIDIOUS_FALLBACK", "1") != "0":
+            try:
+                print("Invidiousフォールバックを試します...")
+                return _invidious_extract_sync(query, search=search)
+            except Exception as e:
+                last_error = e
+                print(f"Invidiousフォールバック失敗: {str(e)[:200]}")
         # 全パターン失敗
         if saw_bot_check:
             raise YouTubeBotCheckError(
