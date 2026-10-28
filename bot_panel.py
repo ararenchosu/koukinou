@@ -476,9 +476,35 @@ async def extract_from_drm_url(url: str):
 
 
 # ---------------- yt-dlp ----------------
+def _is_format_error(e) -> bool:
+    return "Requested format is not available" in str(e)
+
+
+def _is_playable_result(results) -> bool:
+    """storyboard(mhtml)だけ掴んでいないか、URLがあるかを確認"""
+    if not results:
+        return False
+    url = results[0].get("url") or ""
+    fmt = str(results[0].get("format_id") or "")
+    if not url or url.startswith("https://i.ytimg.com/"):
+        return False
+    if fmt.startswith("sb"):  # storyboard
+        return False
+    return True
+
+
 async def extract_info(query: str, search: bool = False):
+    """曲情報を取得する。
+    YouTubeはクライアントごとに返るフォーマットが違い、
+    - web単体だとbot判定
+    - ios / web_embedded単体だと音声フォーマットが無く 'Requested format is not available'
+    - tv_embedded / visionos だと完全な音声フォーマット(251等)が返る
+    といったことが起きる（実測済み）。そのため失敗時は
+    フォーマット条件を緩める + クライアントを変える、を順に試す。
+    """
     loop = asyncio.get_event_loop()
     base_opts = YTDL_SEARCH_OPTIONS if search else YTDL_OPTIONS
+    ALT_FORMAT = "ba*/ba/b*/b/worst"
 
     def _extract_with(opts):
         ydl = yt_dlp.YoutubeDL(opts)
@@ -489,34 +515,56 @@ async def extract_info(query: str, search: bool = False):
             if d is None:
                 continue
             results.append({
-                "url": d["url"],
+                "url": d.get("url"),
                 "title": d.get("title", "Unknown"),
                 "webpage_url": d.get("webpage_url", query),
                 "duration": d.get("duration"),
                 "thumbnail": d.get("thumbnail"),
+                "format_id": d.get("format_id"),
             })
         return results
 
+    def _make_opts(fmt=None, clients=None):
+        opts = dict(base_opts)
+        if fmt:
+            opts["format"] = fmt
+        if clients:
+            opts["extractor_args"] = {"youtube": {"player_client": list(clients)}}
+        return opts
+
+    # 試行パターン: (説明, オプション)
+    attempts = [
+        ("通常", _make_opts()),
+        ("フォーマット緩和", _make_opts(fmt=ALT_FORMAT)),
+        ("tv_embedded", _make_opts(fmt=ALT_FORMAT, clients=["tv_embedded"])),
+        ("visionos+tv_embedded", _make_opts(fmt=ALT_FORMAT, clients=["visionos", "tv_embedded"])),
+        ("web+cookies", _make_opts(fmt=ALT_FORMAT, clients=["web"])) if COOKIE_FILE else ("android_vr(最終手段・360p音声付き)", _make_opts(fmt="ba/b/worst", clients=["android_vr"])),
+        ("android_vr(最終手段・360p音声付き)", _make_opts(fmt="ba/b/worst", clients=["android_vr"])),
+    ]
+
     def _extract():
-        try:
-            return _extract_with(base_opts)
-        except Exception as e:
-            if not _is_bot_check_error(e):
+        last_error = None
+        saw_bot_check = False
+        for label, opts in attempts:
+            try:
+                results = _extract_with(opts)
+                if _is_playable_result(results):
+                    if label != "通常":
+                        print(f"抽出成功（{label}）: {query} -> format {results[0].get('format_id')}")
+                    return results
+                # 再生できない形式しかなかった場合は次の試行へ
+                last_error = Exception(f"再生可能なフォーマットがありませんでした（{label}）")
+                print(f"抽出リトライ: {label} では再生可能な形式が無し -> 次を試します")
+            except Exception as e:
+                last_error = e
+                if _is_bot_check_error(e):
+                    saw_bot_check = True
+                if _is_bot_check_error(e) or _is_format_error(e):
+                    print(f"抽出リトライ: {label} 失敗 ({type(e).__name__}: {str(e)[:120]}) -> 次を試します")
+                    continue
                 raise
-            # bot判定されたら、別クライアントで順にリトライ
-            # クッキー使用時はクッキーが活きる web系を優先し、無い時は android系を優先する
-            last_error = e
-            clients = ("web", "web_embedded", "tv", "mweb") if COOKIE_FILE else ("android", "ios", "web_embedded", "android_vr")
-            for client in clients:
-                alt_opts = dict(base_opts)
-                alt_opts["extractor_args"] = {"youtube": {"player_client": [client]}}
-                try:
-                    print(f"YouTube bot判定のため player_client={client} でリトライ中...")
-                    return _extract_with(alt_opts)
-                except Exception as e2:
-                    last_error = e2
-                    if not _is_bot_check_error(e2):
-                        raise
+        # 全パターン失敗
+        if saw_bot_check:
             raise YouTubeBotCheckError(
                 "YouTubeにbot判定されて再生できませんでした。"
                 + (
@@ -526,6 +574,7 @@ async def extract_info(query: str, search: bool = False):
                 )
                 + f" 元のエラー: {last_error}"
             )
+        raise last_error if last_error else Exception("曲情報が取得できませんでした")
 
     return await loop.run_in_executor(None, _extract)
 
