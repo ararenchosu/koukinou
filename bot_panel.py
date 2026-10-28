@@ -493,6 +493,54 @@ def _is_playable_result(results) -> bool:
     return True
 
 
+def _pick_best_format(formats):
+    """rawなformats一覧から、FFmpegで再生できるものを自分で選ぶ（フォーマット選択エラー時の最終手段用）
+    優先度: 音声のみ(https) > 音声のみ(その他) > 音声+映像(360p付近) > 音声を含むもの
+    storyboard(mhtml)やURL無し(SABR形式など)は除外する。
+    """
+    candidates = []
+    for f in formats or []:
+        if not f.get("url"):
+            continue  # URLが無い形式は直接再生できない
+        if f.get("ext") == "mhtml" or f.get("protocol") == "mhtml":
+            continue  # storyboard
+        if str(f.get("format_id") or "").startswith("sb"):
+            continue
+        candidates.append(f)
+    if not candidates:
+        return None
+
+    def is_audio_only(f):
+        return f.get("vcodec") in (None, "none") and f.get("acodec") not in (None, "none")
+
+    def is_combined(f):
+        return f.get("vcodec") not in (None, "none") and f.get("acodec") not in (None, "none")
+
+    audio_only = [f for f in candidates if is_audio_only(f)]
+    if audio_only:
+        audio_only.sort(key=lambda f: (0 if str(f.get("protocol", "")).startswith("http") and f.get("protocol") != "m3u8" else 1,
+                                       -(f.get("abr") or f.get("tbr") or 0)))
+        return audio_only[0]
+
+    combined = [f for f in candidates if is_combined(f)]
+    if combined:
+        combined.sort(key=lambda f: (abs((f.get("height") or 360) - 360), -(f.get("abr") or 0)))
+        return combined[0]
+
+    with_audio = [f for f in candidates if f.get("acodec") not in (None, "none")]
+    if with_audio:
+        with_audio.sort(key=lambda f: -(f.get("abr") or f.get("tbr") or 0))
+        return with_audio[0]
+    return None
+
+
+def _summarize_formats(formats, limit=30):
+    parts = []
+    for f in (formats or [])[:limit]:
+        parts.append(f"{f.get('format_id')}({f.get('ext')}/{f.get('protocol')}/a={f.get('acodec')}/v={f.get('vcodec')}/url={'Y' if f.get('url') else 'N'})")
+    return ", ".join(parts) if parts else "(formats自体が空)"
+
+
 async def extract_info(query: str, search: bool = False):
     """曲情報を取得する。
     YouTubeはクライアントごとに返るフォーマットが違い、
@@ -542,6 +590,53 @@ async def extract_info(query: str, search: bool = False):
         ("android_vr(最終手段・360p音声付き)", _make_opts(fmt="ba/b/worst", clients=["android_vr"])),
     ]
 
+    def _extract_raw(clients=None):
+        """format選択をyt-dlpに任せず、process=Falseで全formatsを取得して自分で選ぶ最終手段"""
+        opts = dict(base_opts)
+        opts.pop("format", None)
+        opts.pop("extract_flat", None)
+        if clients:
+            opts["extractor_args"] = {"youtube": {"player_client": list(clients)}}
+        ydl = yt_dlp.YoutubeDL(opts)
+
+        is_url = isinstance(query, str) and query.startswith("http")
+        if is_url:
+            data = ydl.extract_info(query, download=False, process=False)
+            if data and "entries" in data and data["entries"]:
+                data = data["entries"][0]
+        else:
+            # 検索語の場合は、まずflat検索で動画URLを特定してからraw取得する
+            flat_opts = dict(opts)
+            flat_opts["extract_flat"] = True
+            flat_opts["default_search"] = "ytsearch1"
+            with yt_dlp.YoutubeDL(flat_opts) as flat_ydl:
+                search_data = flat_ydl.extract_info(query, download=False)
+            entries = (search_data or {}).get("entries") or []
+            if not entries:
+                raise Exception("検索結果がありませんでした（raw取得）")
+            first = entries[0]
+            target = first.get("webpage_url") or first.get("url")
+            if target and not str(target).startswith("http"):
+                target = f"https://www.youtube.com/watch?v={first.get('id') or target}"
+            data = ydl.extract_info(target, download=False, process=False)
+
+        if not data:
+            raise Exception("raw取得でデータが空でした")
+        formats = data.get("formats") or []
+        summary = _summarize_formats(formats)
+        print(f"raw取得 formats[{len(formats)}]: {summary}")
+        chosen = _pick_best_format(formats)
+        if not chosen:
+            raise Exception(f"再生可能なURL付きフォーマットがありませんでした。formats: {summary}")
+        return [{
+            "url": chosen["url"],
+            "title": data.get("title", "Unknown"),
+            "webpage_url": data.get("webpage_url", query),
+            "duration": data.get("duration"),
+            "thumbnail": data.get("thumbnail"),
+            "format_id": chosen.get("format_id"),
+        }]
+
     def _extract():
         last_error = None
         saw_bot_check = False
@@ -563,6 +658,22 @@ async def extract_info(query: str, search: bool = False):
                     print(f"抽出リトライ: {label} 失敗 ({type(e).__name__}: {str(e)[:120]}) -> 次を試します")
                     continue
                 raise
+        # 最終手段: format選択を外してrawで全formatsから自分で選ぶ
+        raw_attempts = [(None, "raw(通常)"), (["tv_embedded"], "raw(tv_embedded)"),
+                        (["android_vr"], "raw(android_vr)"),
+                        (["web"], "raw(web)") if COOKIE_FILE else (["visionos", "tv_embedded"], "raw(visionos+tv_embedded)")]
+        for clients, label in raw_attempts:
+            try:
+                results = _extract_raw(clients)
+                if _is_playable_result(results):
+                    print(f"抽出成功（{label}）: {query} -> format {results[0].get('format_id')}")
+                    return results
+            except Exception as e:
+                last_error = e
+                if _is_bot_check_error(e):
+                    saw_bot_check = True
+                print(f"抽出リトライ: {label} 失敗 ({type(e).__name__}: {str(e)[:200]}) -> 次を試します")
+                continue
         # 全パターン失敗
         if saw_bot_check:
             raise YouTubeBotCheckError(
